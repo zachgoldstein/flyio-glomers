@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -94,28 +96,33 @@ func handleBroadcast(msg maelstrom.Message) error {
 	if !ok {
 		return fmt.Errorf("could not convert message to float64, message %s", body["message"])
 	}
-	err := n.Reply(msg, map[string]any{
-		"type": "broadcast_ok",
-	})
+
 	msgData := MessageData{
 		Message: message,
 	}
-
-	if hasData(msgData) {
-		log.Printf("Already received message with data %v", message)
-		return n.Reply(msg, map[string]any{
-			"type": "broadcast_ok",
-		})
-	}
-
 	// Store the message
 	writeStore(msgData)
 
-	log.Println("sending new broadcast data to other nodes")
-	sendBroadcastMsgToActiveNeighbors(map[string]any{
-		"type":    "broadcast",
-		"message": message,
+	err := n.Reply(msg, map[string]any{
+		"type": "broadcast_ok",
 	})
+
+	// if hasData(msgData) {
+	// 	log.Printf("Already received message with data %v", message)
+	// 	return n.Reply(msg, map[string]any{
+	// 		"type": "broadcast_ok",
+	// 	})
+	// }
+
+	// Topology and push vs pull propagation determines msgs-per-op and latency fundamentally
+
+	// Broadcasting to all other nodes couples broadcast requests to msgs-per-op and latency
+	// Alternative is to do it periodically, tune it with ticker time there
+	// log.Println("sending new broadcast data to other nodes")
+	// sendBroadcastMsgToActiveNeighbors(map[string]any{
+	// 	"type":    "broadcast",
+	// 	"message": message,
+	// })
 
 	// This works great for 5 nodes, but broadcast replies start to fail for 25 nodes
 	// I think b/c the jepsen sender is torn down by the time we go to reply
@@ -155,15 +162,6 @@ func sendBroadcastMsgToAll(msg any) {
 		go sendBroadcastMsgToNeighbor(k, msg)
 	}
 }
-
-// Queue of unsent messages
-
-// func handleBroadcastReply(msg maelstrom.Message) error {
-// 	// If nil message.... no response, possible network partition
-// 	// Add message to a queue and handle it later
-
-// 	return nil
-// }
 
 var unsentMsgs []unsentMSG
 
@@ -326,6 +324,69 @@ func handleTopology(msg maelstrom.Message) error {
 	})
 }
 
+// Proactively issue read requests to other nodes, merge their messages into this node
+func triggerMergeAll() {
+	for _, k := range n.NodeIDs() {
+		if k == n.ID() {
+			continue
+		}
+		go readNodeData(k)
+	}
+}
+
+// Pick random % of nodes to merge with
+func triggerMergeSome(percentage float64) {
+
+	shufflesNodes := n.NodeIDs()
+	rand.Shuffle(len(shufflesNodes), func(i, j int) {
+		shufflesNodes[i], shufflesNodes[j] = shufflesNodes[j], shufflesNodes[i]
+	})
+
+	numNodes := math.Floor(float64(len(shufflesNodes)) * percentage)
+	log.Printf("Merging with %v nodes vs total %v", len(shufflesNodes[:int(numNodes)]), len(n.NodeIDs()))
+	for _, k := range shufflesNodes[:int(numNodes)] {
+		if k == n.ID() {
+			continue
+		}
+		go readNodeData(k)
+	}
+}
+
+func triggerMergeNeighbors() {
+	for _, k := range activeNeighbors() {
+		if k == n.ID() {
+			continue
+		}
+		go readNodeData(k)
+	}
+}
+
+func readNodeData(node string) error {
+	ctx, ctxCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer ctxCancel()
+	readResp, err := n.SyncRPC(ctx, node, map[string]any{
+		"type": "read",
+	})
+	if err != nil {
+		log.Printf("Error trying to read other node data: %v", err)
+		return err
+	}
+	log.Printf("Received node read msg!")
+	var readMsg sendReadMsg
+	if err := json.Unmarshal(readResp.Body, &readMsg); err != nil {
+		log.Printf("Could not use read msg after healing partition: %v", err)
+		return err
+	}
+
+	log.Printf("Merging node %v data %v", node, readMsg)
+	for _, msg := range readMsg.Messages {
+		writeStore(MessageData{
+			Message: msg,
+		})
+	}
+	return nil
+}
+
 func main() {
 
 	n = maelstrom.NewNode()
@@ -346,6 +407,8 @@ func main() {
 	// Periodically check queue for unsent message and retry sending them
 	tickerSendQueue := time.NewTicker(200 * time.Millisecond)
 	tickerHealPartition := time.NewTicker(200 * time.Millisecond)
+	tickerReadNodes := time.NewTicker(1000 * time.Millisecond)
+	tickerReadNodesSampling := time.NewTicker(100 * time.Millisecond)
 	done := make(chan bool)
 	go func() {
 		for {
@@ -356,6 +419,13 @@ func main() {
 				healPartition()
 			case <-tickerSendQueue.C:
 				sendAllQueueMsgs()
+			case <-tickerReadNodes.C:
+				triggerMergeAll()
+				// triggerMergeSome(0.90)
+				// triggerMergeNeighbors()
+				// triggerMergeSome(0.60)
+			case <-tickerReadNodesSampling.C:
+				triggerMergeSome(0.10)
 			}
 		}
 	}()
@@ -368,6 +438,8 @@ func main() {
 	time.Sleep(1 * time.Minute)
 	tickerHealPartition.Stop()
 	tickerSendQueue.Stop()
+	tickerReadNodes.Stop()
+	tickerReadNodesSampling.Stop()
 	done <- true
 	log.Println("Ticker stopped")
 }

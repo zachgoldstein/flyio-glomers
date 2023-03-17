@@ -3,3 +3,4 @@ maelstrom-2-uid/store
 maelstrom-broadcast/store
 maelstrom-echo/store
 maelstrom-counter/store
+maelstrom-kafka/store
