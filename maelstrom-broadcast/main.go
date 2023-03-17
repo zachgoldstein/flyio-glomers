@@ -40,7 +40,7 @@ func hasData(data MessageData) bool {
 
 func readStore() []MessageData {
 	storeMutex.RLock()
-	var allMessageData []MessageData
+	allMessageData := []MessageData{}
 	for _, v := range dataStore {
 		allMessageData = append(allMessageData, v)
 	}
@@ -240,12 +240,28 @@ func healPartition() error {
 			log.Printf("Could not use read msg after healing partition: %v", err)
 			return err
 		}
+
 		log.Printf("Healing partition with data %v", readMsg)
 		for _, msg := range readMsg.Messages {
 			writeStore(MessageData{
 				Message: msg,
 			})
 		}
+
+		log.Printf("Fixing original topology for this neighbor %v", readMsg)
+		// remove partitionedNeighbors, add back to activeNeighbors
+		activeNeighborsMap[neighbor] = true
+		delete(partitionedNeighborsMap, neighbor)
+
+		// remove added neighbours,
+		neighbors, ok := currTopology[neighbor]
+		if !ok {
+			log.Fatalf("Could not find neighbors of partitioned node %v", neighbor)
+		}
+		for _, neighbor := range neighbors {
+			delete(activeNeighborsMap, neighbor)
+		}
+		log.Printf("New neighbors %v", activeNeighbors())
 	}
 	return nil
 }
