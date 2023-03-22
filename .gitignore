@@ -4,3 +4,4 @@ maelstrom-broadcast/store
 maelstrom-echo/store
 maelstrom-counter/store
 maelstrom-kafka/store
+maelstrom-txn/store
