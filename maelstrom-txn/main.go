@@ -116,6 +116,10 @@ func dataKey(key string) string {
 	return fmt.Sprintf("%v-data", key)
 }
 
+func rootLockKey() string {
+	return "root-lock"
+}
+
 type Transaction struct {
 	Operations []Operation
 }
@@ -133,19 +137,28 @@ func (txn *Transaction) Keys() []string {
 }
 
 func (txn *Transaction) Lock() error {
-	keys := txn.Keys()
-	log.Printf("Keys to lock %v", keys)
-	for _, key := range keys {
-		err := txn.LockKey(key)
-		if err != nil {
-			log.Printf("Error locking key %v", err)
-			return err
-		}
+	err := txn.LockKey(rootLockKey())
+	if err != nil {
+		log.Printf("Error locking key %v", err)
+		return err
 	}
-	log.Printf("Locked all keys %v", keys)
-
 	return nil
 }
+
+// func (txn *Transaction) Lock() error {
+// 	keys := txn.Keys()
+// 	log.Printf("Keys to lock %v", keys)
+// 	for _, key := range keys {
+// 		err := txn.LockKey(key)
+// 		if err != nil {
+// 			log.Printf("Error locking key %v", err)
+// 			return err
+// 		}
+// 	}
+// 	log.Printf("Locked all keys %v", keys)
+
+// 	return nil
+// }
 
 func (txn *Transaction) LockKey(key string) error {
 	lockKey := lockKey(key)
@@ -173,17 +186,26 @@ func (txn *Transaction) LockKey(key string) error {
 }
 
 func (txn *Transaction) Unlock() error {
-	keys := txn.Keys()
-	log.Printf("Keys to unlock %v", keys)
-	for _, key := range keys {
-		err := txn.UnlockKey(key)
-		if err != nil {
-			log.Printf("Error locking key %v", err)
-		}
+	err := txn.UnlockKey(rootLockKey())
+	if err != nil {
+		log.Printf("Error unlocking key %v", err)
+		return err
 	}
-
 	return nil
 }
+
+// func (txn *Transaction) Unlock() error {
+// 	keys := txn.Keys()
+// 	log.Printf("Keys to unlock %v", keys)
+// 	for _, key := range keys {
+// 		err := txn.UnlockKey(key)
+// 		if err != nil {
+// 			log.Printf("Error locking key %v", err)
+// 		}
+// 	}
+
+// 	return nil
+// }
 
 func (txn *Transaction) UnlockKey(key string) error {
 	log.Printf("Unlocking key %v", key)
