@@ -13,41 +13,132 @@ import (
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
-type MessageData struct {
-	Message float64
-}
+const BroadcastType = BroadcastActiveNeighbors
+const BroadcastSamplePercentage float64 = 0.5
+const BroadcastTimeout = 500 * time.Millisecond
 
-func (m *MessageData) messageKey() string {
-	return fmt.Sprintf("%v", m.Message)
-}
+const PeriodicSyncType = PeriodicSyncAll
+const PeriodicSyncInterval = 1800 * time.Millisecond
+const PeriodicSamplePercentage float64 = 0.9
 
-var storeMutex sync.RWMutex = sync.RWMutex{}
+const MessageTimeout = 500 * time.Millisecond
 
-var dataStore map[string]MessageData = map[string]MessageData{}
+const (
+	BroadcastAll             string = "all"
+	BroadcastSample          string = "sample"
+	BroadcastActiveNeighbors string = "activeNeighbors"
+	BroadcastNone            string = "none"
+)
 
-var n *maelstrom.Node
+const (
+	PeriodicSyncAll       string = "periodicSyncAll"
+	PeriodicSyncSample    string = "periodicSyncSample"
+	PeriodicSyncNone      string = "periodicSyncNone"
+	PeriodicSyncNeighbors string = "periodicSyncNeighbors"
+)
 
-func writeStore(data MessageData) {
-	storeMutex.Lock()
-	dataStore[data.messageKey()] = data
-	storeMutex.Unlock()
-}
+func main() {
 
-func hasData(data MessageData) bool {
-	storeMutex.RLock()
-	_, ok := dataStore[data.messageKey()]
-	storeMutex.RUnlock()
-	return ok
-}
+	n = maelstrom.NewNode()
+	activeNeighborsMap = map[string]bool{}
+	partitionedNeighborsMap = map[string]bool{}
 
-func readStore() []MessageData {
-	storeMutex.RLock()
-	allMessageData := []MessageData{}
-	for _, v := range dataStore {
-		allMessageData = append(allMessageData, v)
+	n.Handle("broadcast", handleBroadcast)
+	n.Handle("read", handleRead)
+	n.Handle("topology", handleTopology)
+
+	// Periodically check queue for unsent message and retry sending them
+	tickerSendQueue := time.NewTicker(200 * time.Millisecond)
+	tickerHealPartition := time.NewTicker(200 * time.Millisecond)
+	tickerReadNodes := time.NewTicker(PeriodicSyncInterval)
+	done := make(chan bool)
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case <-tickerHealPartition.C:
+				healPartition()
+			case <-tickerSendQueue.C:
+				sendAllQueueMsgs()
+			case <-tickerReadNodes.C:
+				switch PeriodicSyncType {
+				case PeriodicSyncAll:
+					triggerMergeAll()
+				case PeriodicSyncSample:
+					triggerMergeSome(PeriodicSamplePercentage)
+				case PeriodicSyncNeighbors:
+					triggerMergeNeighbors()
+				}
+			}
+		}
+	}()
+
+	if err := n.Run(); err != nil {
+		log.Fatal(err)
 	}
-	storeMutex.RUnlock()
-	return allMessageData
+
+	// Run will run indefinitely, but as a last resort, sleep 1 minute then stop
+	time.Sleep(1 * time.Minute)
+	tickerHealPartition.Stop()
+	tickerSendQueue.Stop()
+	tickerReadNodes.Stop()
+	done <- true
+	log.Println("Ticker stopped")
+}
+
+// {
+// "type": "read_ok",
+// "messages": [1, 8, 72, 25]
+// }
+// handleRead sends a reply message with all messages currently stored in memory
+func handleRead(msg maelstrom.Message) error {
+	data := readStore()
+
+	var respData []int
+	for _, msg := range data {
+		respData = append(respData, int(msg.Message))
+	}
+
+	readResp := readMsgResp{
+		Type:     "read_ok",
+		Messages: respData,
+	}
+
+	return n.Reply(msg, readResp)
+}
+
+// {
+// "type": "topology",
+//
+//		"topology": {
+//			"n1": ["n2", "n3"],
+//			"n2": ["n1"],
+//			"n3": ["n1"]
+//		}
+//	}
+//
+// handleTopology sends a reply message to acknowledge the given topology
+func handleTopology(msg maelstrom.Message) error {
+	var tmsg topologyMsg
+	if err := json.Unmarshal(msg.Body, &tmsg); err != nil {
+		return err
+	}
+	log.Printf("Got topology and unmarshalled msg, %v \n", tmsg)
+	currTopology = tmsg.Topology
+	log.Printf("topology , %v \n", currTopology)
+
+	neighbours, ok := currTopology[n.ID()]
+	if !ok {
+		log.Fatal("Could not neighbours for current node in topology call, very weird")
+	}
+	for _, neighbor := range neighbours {
+		activeNeighborsMap[neighbor] = true
+	}
+
+	return n.Reply(msg, map[string]any{
+		"type": "topology_ok",
+	})
 }
 
 type readMsgResp struct {
@@ -86,6 +177,11 @@ func partitionedNeighbors() []string {
 	return neighbors
 }
 
+// {
+// "type": "broadcast",
+// "message": 1000
+// }
+// handleBroadcast replies to ack a new message, then propagates this new message out to the network
 func handleBroadcast(msg maelstrom.Message) error {
 	// Unmarshal the message body as an loosely-typed map.
 	var body map[string]any
@@ -107,37 +203,34 @@ func handleBroadcast(msg maelstrom.Message) error {
 		"type": "broadcast_ok",
 	})
 
-	// if hasData(msgData) {
-	// 	log.Printf("Already received message with data %v", message)
-	// 	return n.Reply(msg, map[string]any{
-	// 		"type": "broadcast_ok",
-	// 	})
-	// }
+	if hasData(msgData) {
+		log.Printf("Already received message with data %v", message)
+		return n.Reply(msg, map[string]any{
+			"type": "broadcast_ok",
+		})
+	}
+	broadcastMsg := map[string]any{
+		"type":    "broadcast",
+		"message": message,
+	}
 
-	// Topology and push vs pull propagation determines msgs-per-op and latency fundamentally
-
-	// Broadcasting to all other nodes couples broadcast requests to msgs-per-op and latency
-	// Alternative is to do it periodically, tune it with ticker time there
-	// log.Println("sending new broadcast data to other nodes")
-	// sendBroadcastMsgToActiveNeighbors(map[string]any{
-	// 	"type":    "broadcast",
-	// 	"message": message,
-	// })
-
-	// This works great for 5 nodes, but broadcast replies start to fail for 25 nodes
-	// I think b/c the jepsen sender is torn down by the time we go to reply
-	// sendBroadcastMsgToAll(map[string]any{
-	// 	"type":    "broadcast",
-	// 	"message": message,
-	// })
-
-	log.Println("broadcast replying")
-	// Echo the original message back with the updated message type.
+	// Send push broadcast with new message data to other nodes
+	switch BroadcastType {
+	case BroadcastAll:
+		sendBroadcastMsgToAll(broadcastMsg)
+	case BroadcastSample:
+		sendBroadcastMsgToSample(broadcastMsg)
+	case BroadcastActiveNeighbors:
+		sendBroadcastMsgToActiveNeighbors(broadcastMsg)
+	}
 	return err
 }
 
+// sendBroadcastMsgToNeighbor will send the given message to a neighbor,
+// and if the message errors, either by timeout or something else, stick
+// the message in a queue to send later, and mark the neighbor as partitioned
 func sendBroadcastMsgToNeighbor(neighbour string, msg any) {
-	ctx, ctxCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	ctx, ctxCancel := context.WithTimeout(context.Background(), BroadcastTimeout)
 	defer ctxCancel()
 	_, err := n.SyncRPC(ctx, neighbour, msg)
 	if err != nil {
@@ -148,19 +241,37 @@ func sendBroadcastMsgToNeighbor(neighbour string, msg any) {
 	log.Printf("Successfully sent message %v to neighbour %v, reply msg %v", msg, neighbour, msg)
 }
 
+// sendBroadcastMsgToActiveNeighbors sends the newly received broadcast message
+// to only the "neighbors". These neighbors are based off the provided topology
 func sendBroadcastMsgToActiveNeighbors(msg any) {
+	log.Println("sending new broadcast data to active neighbor nodes")
 	for _, neighbour := range activeNeighbors() {
 		go sendBroadcastMsgToNeighbor(neighbour, msg)
 	}
 }
 
+// sendBroadcastMsgToAll sends the newly received broadcast message to all other nodes
 func sendBroadcastMsgToAll(msg any) {
+	log.Println("sending new broadcast data to all other nodes")
 	for k := range currTopology {
 		if k == n.ID() {
 			continue
 		}
 		go sendBroadcastMsgToNeighbor(k, msg)
 	}
+}
+
+// sendBroadcastMsgToSample sends the newly received broadcast message to
+// only some other nodes, based on the BroadcastSamplePercentage
+func sendBroadcastMsgToSample(msg any) {
+	randomNodes := getRandomNodeSample(BroadcastSamplePercentage)
+	for _, k := range randomNodes {
+		if k == n.ID() {
+			continue
+		}
+		go sendBroadcastMsgToNeighbor(k, msg)
+	}
+
 }
 
 var unsentMsgs []unsentMSG
@@ -181,28 +292,16 @@ func couldNotSendMsg(neighbour string, body any) {
 	unsentMsgs = append(unsentMsgs, msg)
 }
 
-func sendLatestQueueMsg() {
-	if len(unsentMsgs) == 0 {
-		return
-	}
-	msg := unsentMsgs[len(unsentMsgs)-1]
-	unsentMsgs = unsentMsgs[:len(unsentMsgs)-1]
-	sendBroadcastMsgToActiveNeighbors(msg.Body)
-	// sendBroadcastMsgToAll(msg.Body)
-	log.Printf("Attempting to send queued msg %v", msg)
-}
-
 func sendAllQueueMsgs() {
 	log.Printf("Attempting to send all queued msgs () %v", len(unsentMsgs))
 	for _, msg := range unsentMsgs {
-		// sendBroadcastMsgToActiveNeighbors(msg.Body)
 		sendBroadcastMsgToActiveNeighbors(msg.Body)
 		log.Printf("Attempting to send queued msg %v", msg)
 	}
 	unsentMsgs = []unsentMSG{}
 }
 
-// F
+// markPartitionedNeighbor stores a reference to a node that is partitioned
 func markPartitionedNeighbor(partitionedNeighbor string) {
 	log.Printf("Marking neighbor %s as partitioned", partitionedNeighbor)
 	delete(activeNeighborsMap, partitionedNeighbor)
@@ -219,6 +318,9 @@ func markPartitionedNeighbor(partitionedNeighbor string) {
 	log.Printf("New neighbors %v", activeNeighbors())
 }
 
+// healPartition attempts to read data from previously partitioned nodes,
+// if it does not error out, it will read the nodes data, then remove it from
+// the map of partitioned neighbors
 func healPartition() error {
 	// Attempt to read from partitioned nodes and load missing values
 	for _, neighbor := range partitionedNeighbors() {
@@ -264,64 +366,15 @@ func healPartition() error {
 	return nil
 }
 
-func handleRead(msg maelstrom.Message) error {
-	data := readStore()
-	// {
-	// "type": "read_ok",
-	// "messages": [1, 8, 72, 25]
-	// }
-
-	var respData []int
-	for _, msg := range data {
-		respData = append(respData, int(msg.Message))
-	}
-
-	readResp := readMsgResp{
-		Type:     "read_ok",
-		Messages: respData,
-	}
-
-	return n.Reply(msg, readResp)
-}
-
-// {
-// "type": "topology",
-//
-//		"topology": {
-//			"n1": ["n2", "n3"],
-//			"n2": ["n1"],
-//			"n3": ["n1"]
-//		}
-//	}
-//
-// example topology: "n0":["n3","n1"],"n1":["n4","n2","n0"],"n2":["n1"],"n3":["n0","n4"],"n4":["n1","n3"]
-// is it cylic??
-// n0 -> ["n3","n1"] 	-> n3 ["n0","n4"] 		-> n4 ["n1","n3"] -> n1
-//
-//	-> n1 ["n4","n2","n0"]	-> n2 ["n4","n2"]
-//							-> n4 ["n1","n3"] -> n3 ["n0","n4"] -> n0
-//
-// Yes.....
-func handleTopology(msg maelstrom.Message) error {
-	var tmsg topologyMsg
-	if err := json.Unmarshal(msg.Body, &tmsg); err != nil {
-		return err
-	}
-	log.Printf("Got topology and unmarshalled msg, %v \n", tmsg)
-	currTopology = tmsg.Topology
-	log.Printf("topology , %v \n", currTopology)
-
-	neighbours, ok := currTopology[n.ID()]
-	if !ok {
-		log.Fatal("Could not neighbours for current node in topology call, very weird")
-	}
-	for _, neighbor := range neighbours {
-		activeNeighborsMap[neighbor] = true
-	}
-
-	return n.Reply(msg, map[string]any{
-		"type": "topology_ok",
+// getRandomNodeSample returns a random sample of all nodes
+func getRandomNodeSample(percentage float64) []string {
+	shufflesNodes := n.NodeIDs()
+	rand.Shuffle(len(shufflesNodes), func(i, j int) {
+		shufflesNodes[i], shufflesNodes[j] = shufflesNodes[j], shufflesNodes[i]
 	})
+
+	numNodes := math.Floor(float64(len(shufflesNodes)) * percentage)
+	return shufflesNodes[:int(numNodes)]
 }
 
 // Proactively issue read requests to other nodes, merge their messages into this node
@@ -336,15 +389,9 @@ func triggerMergeAll() {
 
 // Pick random % of nodes to merge with
 func triggerMergeSome(percentage float64) {
-
-	shufflesNodes := n.NodeIDs()
-	rand.Shuffle(len(shufflesNodes), func(i, j int) {
-		shufflesNodes[i], shufflesNodes[j] = shufflesNodes[j], shufflesNodes[i]
-	})
-
-	numNodes := math.Floor(float64(len(shufflesNodes)) * percentage)
-	log.Printf("Merging with %v nodes vs total %v", len(shufflesNodes[:int(numNodes)]), len(n.NodeIDs()))
-	for _, k := range shufflesNodes[:int(numNodes)] {
+	randomNodes := getRandomNodeSample(percentage)
+	log.Printf("Merging with %v nodes vs total %v", len(randomNodes), len(n.NodeIDs()))
+	for _, k := range randomNodes {
 		if k == n.ID() {
 			continue
 		}
@@ -361,8 +408,10 @@ func triggerMergeNeighbors() {
 	}
 }
 
+// readNodeData will send a read message to another node, then store all the messages
+// that are returned
 func readNodeData(node string) error {
-	ctx, ctxCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	ctx, ctxCancel := context.WithTimeout(context.Background(), MessageTimeout)
 	defer ctxCancel()
 	readResp, err := n.SyncRPC(ctx, node, map[string]any{
 		"type": "read",
@@ -387,59 +436,39 @@ func readNodeData(node string) error {
 	return nil
 }
 
-func main() {
+type MessageData struct {
+	Message float64
+}
 
-	n = maelstrom.NewNode()
-	activeNeighborsMap = map[string]bool{}
-	partitionedNeighborsMap = map[string]bool{}
+func (m *MessageData) messageKey() string {
+	return fmt.Sprintf("%v", m.Message)
+}
 
-	// {
-	// "type": "broadcast",
-	// "message": 1000
-	// }
-	n.Handle("broadcast", handleBroadcast)
+var storeMutex sync.RWMutex = sync.RWMutex{}
 
-	// {"type": "read"}
-	n.Handle("read", handleRead)
+var dataStore map[string]MessageData = map[string]MessageData{}
 
-	n.Handle("topology", handleTopology)
+var n *maelstrom.Node
 
-	// Periodically check queue for unsent message and retry sending them
-	tickerSendQueue := time.NewTicker(200 * time.Millisecond)
-	tickerHealPartition := time.NewTicker(200 * time.Millisecond)
-	tickerReadNodes := time.NewTicker(1000 * time.Millisecond)
-	tickerReadNodesSampling := time.NewTicker(100 * time.Millisecond)
-	done := make(chan bool)
-	go func() {
-		for {
-			select {
-			case <-done:
-				return
-			case <-tickerHealPartition.C:
-				healPartition()
-			case <-tickerSendQueue.C:
-				sendAllQueueMsgs()
-			case <-tickerReadNodes.C:
-				triggerMergeAll()
-				// triggerMergeSome(0.90)
-				// triggerMergeNeighbors()
-				// triggerMergeSome(0.60)
-			case <-tickerReadNodesSampling.C:
-				triggerMergeSome(0.10)
-			}
-		}
-	}()
+func writeStore(data MessageData) {
+	storeMutex.Lock()
+	dataStore[data.messageKey()] = data
+	storeMutex.Unlock()
+}
 
-	if err := n.Run(); err != nil {
-		log.Fatal(err)
+func hasData(data MessageData) bool {
+	storeMutex.RLock()
+	_, ok := dataStore[data.messageKey()]
+	storeMutex.RUnlock()
+	return ok
+}
+
+func readStore() []MessageData {
+	storeMutex.RLock()
+	allMessageData := []MessageData{}
+	for _, v := range dataStore {
+		allMessageData = append(allMessageData, v)
 	}
-
-	// Run will run indefinitely, but as a last resort, sleep 1 minute then stop
-	time.Sleep(1 * time.Minute)
-	tickerHealPartition.Stop()
-	tickerSendQueue.Stop()
-	tickerReadNodes.Stop()
-	tickerReadNodesSampling.Stop()
-	done <- true
-	log.Println("Ticker stopped")
+	storeMutex.RUnlock()
+	return allMessageData
 }
