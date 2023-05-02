@@ -65,7 +65,6 @@ func commitKey(logName string) string {
 // Each piece of log data is stored in it's own key.
 // This depends on the lin-kv store for consistency guarantees.
 func handleSend(msg maelstrom.Message) error {
-	log.Printf("Handling send")
 	var msgRecv struct {
 		Type string `json:"type"`
 		Key  string `json:"key"`
@@ -78,7 +77,6 @@ func handleSend(msg maelstrom.Message) error {
 	}
 
 	// Read offset for this key
-	log.Printf("Reading offset for this key: %s", msgRecv.Key)
 	offsetKey := offsetKey(msgRecv.Key)
 	ctxWrite, ctxWriteCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer ctxWriteCancel()
@@ -88,8 +86,7 @@ func handleSend(msg maelstrom.Message) error {
 		readOffset = int(0)
 	}
 
-	// increment offset for this specific log and cas on kv store
-	log.Printf("Incrementing offset for this key: %s, prev read offset is %v", msgRecv.Key, readOffset)
+	// Increment offset for this specific log and cas on kv store
 	castReadOffset := readOffset.(int)
 	ctxOffset, ctxOffsetCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer ctxOffsetCancel()
@@ -102,7 +99,6 @@ func handleSend(msg maelstrom.Message) error {
 
 	// Write log for this key
 	logKey := logKey(msgRecv.Key, newOffsetKey)
-	log.Printf("Writing log key %s = %s", logKey, msgRecv.Key)
 	ctxWriteLog, ctxWriteLogCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer ctxWriteLogCancel()
 	err = kv.Write(ctxWriteLog, logKey, msgRecv.Msg)
@@ -111,12 +107,10 @@ func handleSend(msg maelstrom.Message) error {
 		return err
 	}
 
-	log.Printf("new offset key: %v", newOffsetKey)
 	msgReply := map[string]any{
 		"type":   "send_ok",
 		"offset": newOffsetKey,
 	}
-	log.Printf("Replying to node %v with data: %v", msg.Src, msgReply)
 	err = n.Reply(msg, msgReply)
 	if err != nil {
 		log.Printf("Error replying to send... %v", err)
@@ -143,7 +137,6 @@ func handleSend(msg maelstrom.Message) error {
 //
 // handlePoll returns messages in a log, starting from the given offset up to the current offset
 func handlePoll(msg maelstrom.Message) error {
-	log.Printf("Handling poll")
 	var msgRecv struct {
 		Type    string         `json:"type"`
 		Offsets map[string]int `json:"offsets"`
@@ -163,8 +156,7 @@ func handlePoll(msg maelstrom.Message) error {
 		Msgs: map[string][][]int{},
 	}
 
-	log.Printf("Retrieving logs and scanning for subset")
-
+	// Retrieving logs and scanning for subset
 	for key, offset := range msgRecv.Offsets {
 		replyData, err := retrieveLogData(offset, key)
 		if err != nil {
@@ -175,7 +167,6 @@ func handlePoll(msg maelstrom.Message) error {
 		msgReply.Msgs[key] = replyData
 	}
 
-	log.Printf("Replying to node %v with data: %v", msg.Src, msgReply)
 	err = n.Reply(msg, msgReply)
 	if err != nil {
 		log.Printf("Error replying to poll... %v", err)
@@ -191,7 +182,6 @@ func retrieveLogData(offset int, key string) ([][]int, error) {
 	replyData := [][]int{}
 	// Get log for this key
 	// Start at offset, request keys for all data up to current offset
-	log.Printf("Reading offset for this key: %s", key)
 	offsetKey := offsetKey(key)
 	ctxWrite, ctxWriteCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer ctxWriteCancel()
@@ -203,8 +193,6 @@ func retrieveLogData(offset int, key string) ([][]int, error) {
 
 	startOffset := offset
 	keysToPoll := readOffset.(int) - startOffset + 1 // We actually start to store at 1, b/c of early increment
-	log.Printf("Reading kv %v times (%v-%v) for poll of log %s", keysToPoll, readOffset.(int), startOffset, key)
-
 	for i := 0; i < keysToPoll; i++ {
 		currOffset := startOffset + i
 		keyToPoll := logKey(key, currOffset)
@@ -236,7 +224,6 @@ func retrieveLogData(offset int, key string) ([][]int, error) {
 // handleCommitOffsets informs the node that messages have been successfully processed
 // up to and including the given offset.
 func handleCommitOffsets(msg maelstrom.Message) error {
-	log.Printf("Handling commit offsets")
 	// store the committed offset for each key
 	var msgRecv struct {
 		Type    string         `json:"type"`
@@ -248,7 +235,7 @@ func handleCommitOffsets(msg maelstrom.Message) error {
 		return err
 	}
 
-	log.Printf("Storing commit_offsets")
+	// Storing commit_offsets
 	for key, offset := range msgRecv.Offsets {
 		commitKey := commitKey(key)
 		ctxWriteLog, ctxWriteLogCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
@@ -262,7 +249,6 @@ func handleCommitOffsets(msg maelstrom.Message) error {
 	msgReply := map[string]any{
 		"type": "commit_offsets_ok",
 	}
-	log.Printf("Replying to node %v with data: %v", msg.Src, msgReply)
 	err = n.Reply(msg, msgReply)
 	if err != nil {
 		log.Printf("Error replying to commit offsets... %v", err)
@@ -287,8 +273,6 @@ func handleCommitOffsets(msg maelstrom.Message) error {
 // handleListCommittedOffsets returns a map of committed offsets for a given set of logs.
 // Clients use this to figure out where to start consuming from in a given log.
 func handleListCommittedOffsets(msg maelstrom.Message) error {
-	log.Printf("Handling list committed offsets")
-
 	// read the committed offset for each key
 	var msgRecv struct {
 		Type string   `json:"type"`
@@ -309,7 +293,7 @@ func handleListCommittedOffsets(msg maelstrom.Message) error {
 		Offsets: map[string]int{},
 	}
 
-	log.Printf("Retrieving commit_offsets")
+	// Retrieving commit_offsets
 	for _, key := range msgRecv.Keys {
 		commitKey := commitKey(key)
 		ctxReadLog, ctxReadLogCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
@@ -322,7 +306,6 @@ func handleListCommittedOffsets(msg maelstrom.Message) error {
 		msgReply.Offsets[key] = offset.(int)
 	}
 
-	log.Printf("Replying to node %v with data: %v", msg.Src, msgReply)
 	err = n.Reply(msg, msgReply)
 	if err != nil {
 		log.Printf("Error replying to list commit offsets... %v", err)

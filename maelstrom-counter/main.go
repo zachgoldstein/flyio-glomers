@@ -41,7 +41,6 @@ func main() {
 	time.Sleep(1 * time.Minute)
 	tickerReadNodeCount.Stop()
 	done <- true
-	log.Println("Ticker stopped")
 }
 
 //	{
@@ -52,8 +51,6 @@ func main() {
 // return { "type": "add_ok" }
 // handleAdd accepts add requests and increments the local memory store for the current node
 func handleAdd(msg maelstrom.Message) error {
-	log.Printf("Handling add")
-
 	err := n.Reply(msg, map[string]any{
 		"type": "add_ok",
 	})
@@ -71,8 +68,6 @@ func handleAdd(msg maelstrom.Message) error {
 		fmt.Printf("error unmarshalling add message body: %s\n", err)
 		return err
 	}
-
-	log.Printf("Adding delta to current node %v", msgData.Delta)
 	// Increment local counter for this node by delta
 	addCountForNode(n.ID(), msgData.Delta)
 
@@ -95,22 +90,17 @@ type readReplyStruct struct {
 // handleRead accepts read requests and returns the current value of the global counter.
 // It adds together the counts in local memory for all nodes and returns the sum
 func handleRead(msg maelstrom.Message) error {
-	log.Printf("Handling read")
 	storeDataSlice := readStore()
-	log.Printf("Node counts %v", storeDataSlice)
 
 	sum := 0.0
 	for _, storeData := range storeDataSlice {
-		log.Printf("Summing from data: %v", storeData)
 		sum += storeData.Message
 	}
-	log.Printf("Counted up node counts, sum: %v", sum)
 
 	replyData := readReplyStruct{
 		Type:  "read_ok",
 		Value: sum,
 	}
-	log.Printf("Replying to node %v with data: %v", msg.Src, replyData)
 	err := n.Reply(msg, replyData)
 	if err != nil {
 		log.Printf("Error replying... %v", err)
@@ -121,9 +111,7 @@ func handleRead(msg maelstrom.Message) error {
 
 // handleCount replies to msgs with the current count for only this node
 func handleCount(msg maelstrom.Message) error {
-	log.Printf("Handling count")
 	storeData := readStoreCurrentNode()
-	log.Printf("Returning count %v", storeData.Message)
 	err := n.Reply(msg, map[string]any{
 		"type":  "count",
 		"value": storeData.Message,
@@ -138,7 +126,6 @@ func handleCount(msg maelstrom.Message) error {
 // mergeNodeCounts sends a "count" message to all other nodes, storing
 // in local memory the count for each other node
 func mergeNodeCounts() {
-	log.Printf("Merging node counts")
 	for _, neighbor := range n.NodeIDs() {
 		if n.ID() == neighbor {
 			continue
@@ -149,7 +136,6 @@ func mergeNodeCounts() {
 
 // mergeNodeCount sends a count request to another node, storing the result in local memory
 func mergeNodeCount(node string) {
-	log.Printf("Attempting to get count from other node %v", node)
 	ctx, ctxCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer ctxCancel()
 	msg := map[string]any{
@@ -159,7 +145,6 @@ func mergeNodeCount(node string) {
 	if err != nil {
 		log.Printf("Could not send message %v to node %v, err %v", msg, node, err)
 	}
-	log.Printf("Successfully sent message %v to node %v, reply msg %v", msg, node, msgReply)
 
 	type msgReplyStruct struct {
 		Type  string  `json:"type"`
@@ -169,7 +154,6 @@ func mergeNodeCount(node string) {
 	if err = json.Unmarshal(msgReply.Body, &msgReplyData); err != nil {
 		log.Printf("error unmarshalling manifest body: %s\n", err)
 	}
-	log.Printf("Merging count from other node %v", node)
 	setCountForNode(node, msgReplyData.Value)
 }
 
@@ -183,7 +167,6 @@ func addCountForNode(nodeID string, count float64) {
 	}
 	nodeCurrCount = currentData.Message
 	sum := nodeCurrCount + count
-	log.Printf("Adding current count %v to new delta %v, setting to %v", nodeCurrCount, count, sum)
 	writeStore(StoreData{
 		Node:    nodeID,
 		Message: sum,
@@ -205,7 +188,6 @@ type StoreData struct {
 
 func (m *StoreData) messageKey() string {
 	key := fmt.Sprintf("%v", m.Node)
-	log.Printf("returning message key %v", key)
 	return key
 }
 
@@ -217,13 +199,6 @@ func writeStore(data StoreData) {
 	storeMutex.Lock()
 	dataStore[data.messageKey()] = data
 	storeMutex.Unlock()
-}
-
-func hasData(data StoreData) bool {
-	storeMutex.RLock()
-	defer storeMutex.RUnlock()
-	_, ok := dataStore[data.messageKey()]
-	return ok
 }
 
 func readStore() []StoreData {
